@@ -10,7 +10,45 @@ import torch
 import torch.nn as nn
 
 class LinearQuant:
-    pass
+    def __init__(self, tensor, scale, zero_point, n_bits, layerwise=False):
+        self.tensor = tensor
+        self.scale = scale
+        self.zero_point = zero_point
+        self.n_bits = n_bits
+        self.layerwise = layerwise
+        
+    def __call__(self, tensor, scale, zero_point, n_bits, layerwise=False):
+        return self.quantize_dequantize(tensor, scale, zero_point, n_bits, layerwise)
+    
+    def quantize_dequantize(self, tensor, scale, zero_point, n_bits, layerwise=False):
+        # Calculate quantization range
+        qmin = 0
+        qmax = 2 ** n_bits - 1
+        
+        if layerwise:
+            # Use single scale and zero_point for entire tensor
+            scale = scale.view(1, 1)
+            zero_point = zero_point.view(1, 1)
+        
+        # Quantize: round((x / scale) + zero_point)
+        quantized = torch.clamp(
+            torch.round(tensor / scale + zero_point), 
+            qmin, qmax
+        )
+        
+        # Dequantize: scale * (quantized - zero_point)
+        dequantized = scale * (quantized - zero_point)
+        
+        return dequantized
+    
+    def to(self, dtype):
+        return self.quantize_dequantize(
+            self.tensor, 
+            self.scale, 
+            self.zero_point, 
+            self.n_bits, 
+            self.layerwise
+        ).to(dtype)
 
 class QuantizeLinear(nn.Linear):
     def __init__(
@@ -25,7 +63,14 @@ class QuantizeLinear(nn.Linear):
         self.weight_layerwise = weight_layerwise
         # params for weight quant
         if self.w_bits < 16:
-            self.weight_clip_val = nn.Parameter(torch.Tensor(self.weight.shape[0], 1))
+            if self.weight_layerwise:
+                # Single scale and zero_point for entire weight tensor
+                self.weight_scale = nn.Parameter(torch.Tensor(1, 1))
+                self.weight_zero_point = nn.Parameter(torch.Tensor(1, 1))
+            else:
+                # Per-channel (output channel) scale and zero_point
+                self.weight_scale = nn.Parameter(torch.Tensor(self.weight.shape[0], 1))
+                self.weight_zero_point = nn.Parameter(torch.Tensor(self.weight.shape[0], 1))
 
     def forward(self, input_):
         # quantize weight
@@ -37,7 +82,8 @@ class QuantizeLinear(nn.Linear):
         elif self.w_bits <= 8:
             weight = LinearQuant(
                 real_weights,
-                self.weight_clip_val,
+                self.weight_scale,
+                self.weight_zero_point,
                 self.w_bits,
                 self.weight_layerwise,
             ).to(input_.dtype)
