@@ -137,7 +137,7 @@ def main(prompt):
     count_parameters(pipe.transformer)
 
     samples_dir = Path("output") / "samples"
-    generate_images(pipe, prompt, samples_dir / "bf16", 'cuda', seed=42)
+    generate_images(pipe, prompt, samples_dir / "bf16", seed=42)
     print(f"Samples saved to '{samples_dir / 'bf16'}'")
 
     torch.cuda.empty_cache()
@@ -150,7 +150,7 @@ def main(prompt):
         # Load new model
         pipe.transformer = load_quantized_model(model_name, w_bits=w_bits)
         count_parameters(pipe.transformer)
-        generate_images(pipe, prompt, samples_dir / f"w{w_bits}", 'cuda', seed=42)
+        generate_images(pipe, prompt, samples_dir / f"w{w_bits}", seed=42)
         print(f"Samples saved to '{samples_dir / f'w{w_bits}'}'")
         
         # Clean up after each iteration
