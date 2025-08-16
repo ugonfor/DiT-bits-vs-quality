@@ -1,3 +1,4 @@
+from email import utils
 import math
 
 from models.transformer_flux import (
@@ -21,23 +22,37 @@ log = logging.getLogger(__name__)
 def count_parameters(model):
     total_params = sum(p.numel() for p in model.parameters())
     linear_params = 0
+    quantize_linear_params = 0
 
     for name, module in model.named_modules():
         if isinstance(module, nn.Linear):
             if not 'transformer' in name:
                 continue
             linear_params += sum(p.numel() for p in module.parameters())
+            
+            # Check if it's QuantizeLinear (imported from your utils_quant)
+            from models.utils_quant import QuantizeLinear
+            if isinstance(module, QuantizeLinear):
+                quantize_linear_params += sum(p.numel() for p in module.parameters())
 
-    ratio = linear_params / total_params if total_params > 0 else 0
+    linear_ratio = linear_params / total_params if total_params > 0 else 0
+    quantize_ratio = quantize_linear_params / total_params if total_params > 0 else 0
+    quantize_linear_ratio = quantize_linear_params / linear_params if linear_params > 0 else 0
 
     print(f"Total parameters: {total_params}")
     print(f"Linear layer parameters: {linear_params}")
-    print(f"Linear layer parameter ratio: {ratio:.4f}")
+    print(f"QuantizeLinear parameters: {quantize_linear_params}")
+    print(f"Linear layer parameter ratio: {linear_ratio:.4f}")
+    print(f"QuantizeLinear parameter ratio (vs total): {quantize_ratio:.4f}")
+    print(f"QuantizeLinear parameter ratio (vs linear): {quantize_linear_ratio:.4f}")
 
     return {
         "total": total_params,
         "linear": linear_params,
-        "ratio": ratio
+        "quantize_linear": quantize_linear_params,
+        "linear_ratio": linear_ratio,
+        "quantize_ratio": quantize_ratio,
+        "quantize_linear_ratio": quantize_linear_ratio
     }
 
 def load_quantized_model(model_args, training_args, w_bits=16):
@@ -53,61 +68,56 @@ def load_quantized_model(model_args, training_args, w_bits=16):
     )
 
     weight_scale_dict = {}
-    for name, param in tqdm(model.named_parameters(), desc="Initializing weight_scale"):
+    for name, param in tqdm(model.named_parameters(), desc="Initializing weight_scale and weight_zero_point"):
         if "weight_scale" in name:
             weight_name = name.replace("weight_scale", "weight")
             weight_param = dict(model.named_parameters()).get(weight_name, None)
 
             if w_bits <= 8:
+                # Calculate scale
                 xmax, _ = torch.max(torch.abs(weight_param), dim=-1, keepdim=True)
                 maxq = 2 ** (w_bits - 1) - 1
                 scale = xmax / maxq
+                weight_scale_dict[name] = scale
+                
+                # Calculate zero_point
+                zero_point_name = name.replace("weight_scale", "weight_zero_point")
+                xmin, _ = torch.min(weight_param, dim=-1, keepdim=True)
+                xmax, _ = torch.max(weight_param, dim=-1, keepdim=True)
+                qmin = 0
+                qmax = 2 ** w_bits - 1
+                
+                # Calculate zero point: zero_point = qmin - round(xmin / scale)
+                zero_point = qmin - torch.round(xmin / scale)
+                zero_point = torch.clamp(zero_point, qmin, qmax)
+                weight_scale_dict[zero_point_name] = zero_point
             else:
                 raise NotImplementedError
 
-            weight_scale_dict[name] = scale
     model.load_state_dict(weight_scale_dict, assign=True, strict=False)
 
     return model
 
+def generate_images(pipe, prompt, num_images, output_dir, device, seed):
+    generator = torch.manual_seed(seed)
+    images = pipe(prompt, num_images=num_images, generator=generator).images
+    for i, img in enumerate(images):
+        img.save(output_dir / f"image_{i}.png")
 
-def sanity(debug=False):
+def main(prompt):
     # Sanity Check Full Precision
-    dtype = torch.bfloat16 if training_args.bf16 else torch.float
-    pipe: FluxPipeline = DiffusionPipeline.from_pretrained(model_args.input_model_filename, torch_dtype=dtype).to('cuda')
+    model_name = "black-forest-labs/FLUX.1-dev"
+    pipe: FluxPipeline = DiffusionPipeline.from_pretrained(model_name, torch_dtype=torch.bfloat16).to('cuda')
 
     count_parameters(pipe.transformer)
 
-    samples_dir = Path(training_args.output_dir) / "samples" / "bf16"
-    print(f"Generating 2 sample images …")
-    utils.generate_images(pipe, prompts, 2, samples_dir, 'cuda', seed=42)
+    samples_dir = Path("output") / "samples" / "bf16"
+    generate_images(pipe, prompt, 2, samples_dir / "try1", 'cuda', seed=42)
+    generate_images(pipe, prompt, 2, samples_dir / "try2", 'cuda', seed=42)
     print(f"Samples saved to '{samples_dir}'")
     
     del pipe.transformer
     torch.cuda.empty_cache()
 
-    for w_bits in [16, 8]: # 2, 0]: # 16, 8, 4, 2, 0]:
-        # load model
-        log.info(f"Start to load model... w_bits: {w_bits}")
-        cache_dir = Path(training_args.output_dir) / "cache" / f"bits_{w_bits}"
-        model = load_quantized_model(model_args, training_args, w_bits=w_bits)
-        model.cuda()
-        pipe.transformer = model
-        log.info("Complete model loading...")
-        
-        # inference model
-        samples_dir = Path(training_args.output_dir) / "samples" / f"bits_{w_bits}"
-        print(f"Generating 2 sample images …")
-        utils.generate_images(pipe, prompts, 2, samples_dir, 'cuda', seed=42)
-        print(f"Samples saved to '{samples_dir}'")
-
-        breakpoint()
-
-        # save and remove model
-        model.save_pretrained(cache_dir)
-        del model
-        torch.cuda.empty_cache()
-
-
 if __name__ == "__main__":
-    sanity(debug=True)
+    main(prompt="A fantasy landscape with mountains and a river")
