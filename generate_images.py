@@ -15,8 +15,8 @@ from pathlib import Path
 from tqdm import tqdm
 
 import torch.nn as nn
-
-log = utils.get_logger("clm")
+import logging
+log = logging.getLogger(__name__)
 
 def count_parameters(model):
     total_params = sum(p.numel() for p in model.parameters())
@@ -52,10 +52,10 @@ def load_quantized_model(model_args, training_args, w_bits=16):
         w_bits=w_bits
     )
 
-    weight_clip_val_dict = {}
-    for name, param in tqdm(model.named_parameters(), desc="Initializing weight_clip_val"):
-        if "weight_clip_val" in name:
-            weight_name = name.replace("weight_clip_val", "weight")
+    weight_scale_dict = {}
+    for name, param in tqdm(model.named_parameters(), desc="Initializing weight_scale"):
+        if "weight_scale" in name:
+            weight_name = name.replace("weight_scale", "weight")
             weight_param = dict(model.named_parameters()).get(weight_name, None)
 
             if w_bits <= 8:
@@ -64,10 +64,10 @@ def load_quantized_model(model_args, training_args, w_bits=16):
                 scale = xmax / maxq
             else:
                 raise NotImplementedError
-                
-            weight_clip_val_dict[name] = scale
-    model.load_state_dict(weight_clip_val_dict, assign=True, strict=False)
-    
+
+            weight_scale_dict[name] = scale
+    model.load_state_dict(weight_scale_dict, assign=True, strict=False)
+
     return model
 
 
