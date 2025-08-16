@@ -9,6 +9,7 @@ from tqdm import tqdm
 
 import torch.nn as nn
 import logging
+import glob
 log = logging.getLogger(__name__)
 
 def count_parameters(model):
@@ -120,12 +121,14 @@ def load_quantized_model(model_name, w_bits=16):
     
     return model
 
-def generate_images(pipe, prompt, output_dir, device, seed):
+def generate_images(pipe, prompt, output_dir, seed):
     output_dir.mkdir(parents=True, exist_ok=True)
     generator = torch.manual_seed(seed)
-    images = pipe(prompt, generator=generator).images
-    for i, img in enumerate(images):
-        img.save(output_dir / f"image_{i}.png")
+    image = pipe(prompt, generator=generator).images[0]
+
+    # count index of image
+    image_index = len(list(glob.glob(str(output_dir / "*.png"))))
+    image.save(output_dir / f"{image_index}.png")
 
 def main(prompt):
     # Sanity Check Full Precision
@@ -156,3 +159,4 @@ def main(prompt):
 
 if __name__ == "__main__":
     main(prompt="A fantasy landscape with mountains and a river")
+    main(prompt="Cyberpunk samurai on a neon-lit rooftop at dusk, dramatic rim lighting, 32-bit render")
