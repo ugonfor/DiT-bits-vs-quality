@@ -12,31 +12,34 @@ import logging
 log = logging.getLogger(__name__)
 
 def count_parameters(model):
+    from models.utils_quant import QuantizeLinear
+    
     total_params = sum(p.numel() for p in model.parameters())
     linear_params = 0
     quantize_linear_params = 0
 
     for name, module in model.named_modules():
-        if isinstance(module, nn.Linear):
-            if not 'transformer' in name:
-                continue
-            linear_params += sum(p.numel() for p in module.parameters())
+        if not 'transformer' in name:
+            continue
             
-            # Check if it's QuantizeLinear (imported from your utils_quant)
-            from models.utils_quant import QuantizeLinear
-            if isinstance(module, QuantizeLinear):
-                quantize_linear_params += sum(p.numel() for p in module.parameters())
+        # First check for QuantizeLinear specifically
+        if isinstance(module, QuantizeLinear):
+            quantize_linear_params += sum(p.numel() for p in module.parameters())
+        # Then check for regular nn.Linear (but not QuantizeLinear)
+        elif isinstance(module, nn.Linear):
+            linear_params += sum(p.numel() for p in module.parameters())
 
     linear_ratio = linear_params / total_params if total_params > 0 else 0
     quantize_ratio = quantize_linear_params / total_params if total_params > 0 else 0
-    quantize_linear_ratio = quantize_linear_params / linear_params if linear_params > 0 else 0
+    total_linear_params = linear_params + quantize_linear_params
+    quantize_linear_ratio = quantize_linear_params / total_linear_params if total_linear_params > 0 else 0
 
     print(f"Total parameters: {total_params}")
-    print(f"Linear layer parameters: {linear_params}")
+    print(f"Regular Linear layer parameters: {linear_params}")
     print(f"QuantizeLinear parameters: {quantize_linear_params}")
-    print(f"Linear layer parameter ratio: {linear_ratio:.4f}")
+    print(f"Regular Linear layer parameter ratio: {linear_ratio:.4f}")
     print(f"QuantizeLinear parameter ratio (vs total): {quantize_ratio:.4f}")
-    print(f"QuantizeLinear parameter ratio (vs linear): {quantize_linear_ratio:.4f}")
+    print(f"QuantizeLinear parameter ratio (vs all linear): {quantize_linear_ratio:.4f}")
 
     return {
         "total": total_params,
@@ -114,6 +117,10 @@ def load_quantized_model(model_name, w_bits=16):
         raise NotImplementedError
 
     model.load_state_dict(weight_scale_dict, assign=True, strict=False)
+    
+    # 모델을 GPU로 이동
+    model = model.to('cuda')
+    
     return model
 
 def generate_images(pipe, prompt, output_dir, device, seed):
