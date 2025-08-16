@@ -55,10 +55,27 @@ class QuantizeLinear(nn.Linear):
         bias=False,
         w_bits=16,
         weight_layerwise=False,
+        use_low_rank=False,
+        low_rank_dim=None,
+        low_rank_alpha=1.0,
     ):
         super(QuantizeLinear, self).__init__(*kargs, bias=bias)
         self.w_bits = w_bits
         self.weight_layerwise = weight_layerwise
+        self.use_low_rank = use_low_rank
+        self.low_rank_alpha = low_rank_alpha
+        
+        # Low rank decomposition parameters (not quantized)
+        if self.use_low_rank:
+            assert low_rank_dim is not None, "low_rank_dim must be specified when use_low_rank=True"
+            self.low_rank_dim = low_rank_dim
+            in_features = self.weight.shape[1]
+            out_features = self.weight.shape[0]
+            
+            # Initialize low rank matrices A and B (full precision)
+            self.low_rank_A = nn.Parameter(torch.randn(out_features, low_rank_dim) * 0.01)
+            self.low_rank_B = nn.Parameter(torch.randn(low_rank_dim, in_features) * 0.01)
+        
         # params for weight quant
         if self.w_bits < 16:
             if self.weight_layerwise:
@@ -76,9 +93,9 @@ class QuantizeLinear(nn.Linear):
         real_weights = self.weight
 
         if self.w_bits >= 16:
-            weight = self.weight
+            base_weight = self.weight
         elif self.w_bits <= 8:
-            weight = LinearQuant(
+            base_weight = LinearQuant(
                 real_weights,
                 self.weight_scale,
                 self.weight_zero_point,
@@ -88,7 +105,14 @@ class QuantizeLinear(nn.Linear):
         else:
             raise NotImplementedError
 
-        out = nn.functional.linear(input_, weight)
+        # Add low rank branch if enabled (full precision)
+        if self.use_low_rank:
+            low_rank_weight = torch.matmul(self.low_rank_A, self.low_rank_B)
+            final_weight = base_weight + self.low_rank_alpha * low_rank_weight
+        else:
+            final_weight = base_weight
+
+        out = nn.functional.linear(input_, final_weight)
         if self.bias is not None:
             out += self.bias.view(1, -1).expand_as(out)
 
