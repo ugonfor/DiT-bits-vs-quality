@@ -136,6 +136,16 @@ def initialize_low_rank_svd_task(args):
             A_init = A_init.to(original_dtype)
             B_init = B_init.to(original_dtype)
 
+        # Move results back to CPU to free GPU memory
+        A_init = A_init.cpu()
+        B_init = B_init.cpu()
+
+        # Clear intermediate tensors from GPU
+        del residual, U, S, Vt, U_k, S_k, Vt_k, sqrt_S_k
+        if low_rank_dim > k:
+            del A_pad, B_pad
+        torch.cuda.empty_cache()
+
         low_rank_B_name = low_rank_A_name.replace("low_rank_A", "low_rank_B")
         return low_rank_A_name, A_init, low_rank_B_name, B_init
 
@@ -161,6 +171,13 @@ def calculate_quantized_weight_task(args):
         layerwise=False,
     ).to(original_weight.dtype)
 
+    # Move results back to CPU to free GPU memory
+    original_weight = original_weight.cpu()
+    quantized_weight = quantized_weight.cpu()
+
+    # Clear GPU cache
+    torch.cuda.empty_cache()
+
     return low_rank_A_name, original_weight, quantized_weight
 
 
@@ -184,13 +201,20 @@ def initialize_low_rank_with_svd_parallel(model, w_bits, low_rank_dim):
                 x is not None
                 for x in [original_weight, weight_scale, weight_zero_point]
             ):
+                # Move to CPU to avoid GPU memory buildup
                 quantize_tasks.append(
-                    (name, original_weight, weight_scale, weight_zero_point, w_bits)
+                    (
+                        name,
+                        original_weight.cpu(),
+                        weight_scale.cpu(),
+                        weight_zero_point.cpu(),
+                        w_bits,
+                    )
                 )
 
-    # Process quantized weight calculation in parallel
+    # Process quantized weight calculation in parallel with limited workers
     with ThreadPoolExecutor(
-        max_workers=min(len(quantize_tasks), mp.cpu_count())
+        max_workers=min(4, len(quantize_tasks))  # GPU 메모리를 고려해서 worker 수 제한
     ) as executor:
         quantize_results = list(
             tqdm(
@@ -200,6 +224,10 @@ def initialize_low_rank_with_svd_parallel(model, w_bits, low_rank_dim):
             )
         )
 
+    # Clear intermediate tasks
+    del quantize_tasks
+    torch.cuda.empty_cache()
+
     # Prepare SVD tasks
     svd_tasks = []
     for low_rank_A_name, original_weight, quantized_weight in quantize_results:
@@ -207,9 +235,13 @@ def initialize_low_rank_with_svd_parallel(model, w_bits, low_rank_dim):
             (low_rank_A_name, original_weight, quantized_weight, low_rank_dim)
         )
 
-    # Process SVD tasks in parallel
+    # Clear quantize_results
+    del quantize_results
+    torch.cuda.empty_cache()
+
+    # Process SVD tasks in parallel with limited workers
     with ThreadPoolExecutor(
-        max_workers=min(len(svd_tasks), mp.cpu_count())
+        max_workers=min(4, len(svd_tasks))  # GPU 메모리를 고려해서 worker 수 제한
     ) as executor:
         svd_results = list(
             tqdm(
@@ -219,14 +251,26 @@ def initialize_low_rank_with_svd_parallel(model, w_bits, low_rank_dim):
             )
         )
 
+    # Clear SVD tasks
+    del svd_tasks
+    torch.cuda.empty_cache()
+
     # Update model parameters
     low_rank_dict = {}
     for A_name, A_init, B_name, B_init in svd_results:
         low_rank_dict[A_name] = A_init
         low_rank_dict[B_name] = B_init
 
+    # Clear results
+    del svd_results
+    torch.cuda.empty_cache()
+
     # Load the initialized low-rank parameters
     model.load_state_dict(low_rank_dict, assign=True, strict=False)
+
+    # Clear dictionary
+    del low_rank_dict
+    torch.cuda.empty_cache()
 
 
 def load_quantized_model(
