@@ -4,45 +4,47 @@ from models.transformer_flux import (
 )
 from models.utils_quant import QuantizeLinear, LinearQuant
 import matplotlib.pyplot as plt
-import numpy as np
 from pathlib import Path
 import json
 from tqdm import tqdm
-import multiprocessing as mp
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import gc
 
 
-def calculate_layer_errors(original_weight, quantized_weight, low_rank_weight=None):
-    """개별 레이어의 quantization error 계산"""
+def calculate_layer_errors_gpu(original_weight, quantized_weight, low_rank_weight=None):
+    """GPU에서 레이어별 quantization error 계산"""
     with torch.no_grad():
-        # Basic quantization error
-        quant_error = original_weight - quantized_weight
-        quant_mse = torch.mean(quant_error**2).item()
-        quant_mae = torch.mean(torch.abs(quant_error)).item()
+        # Ensure tensors are on GPU
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        original_weight = original_weight.to(device)
+        quantized_weight = quantized_weight.to(device)
 
-        # Relative error (normalized by original weight magnitude)
-        weight_norm = torch.norm(original_weight).item()
-        quant_relative_error = torch.norm(quant_error).item() / (weight_norm + 1e-8)
+        # Basic quantization error (GPU에서 계산)
+        quant_error = original_weight - quantized_weight
+        quant_mse = torch.mean(quant_error**2)
+        quant_mae = torch.mean(torch.abs(quant_error))
+
+        # Relative error (GPU에서 계산)
+        weight_norm = torch.norm(original_weight)
+        quant_relative_error = torch.norm(quant_error) / (weight_norm + 1e-8)
 
         errors = {
-            "quantization_mse": quant_mse,
-            "quantization_mae": quant_mae,
-            "quantization_relative_error": quant_relative_error,
-            "original_weight_norm": weight_norm,
+            "quantization_mse": quant_mse.item(),
+            "quantization_mae": quant_mae.item(),
+            "quantization_relative_error": quant_relative_error.item(),
+            "original_weight_norm": weight_norm.item(),
         }
 
-        # Low-rank compensation error if available
+        # Low-rank compensation error if available (GPU에서 계산)
         if low_rank_weight is not None:
+            low_rank_weight = low_rank_weight.to(device)
             compensated_weight = quantized_weight + low_rank_weight
             compensation_error = original_weight - compensated_weight
-            comp_mse = torch.mean(compensation_error**2).item()
-            comp_mae = torch.mean(torch.abs(compensation_error)).item()
-            comp_relative_error = torch.norm(compensation_error).item() / (
-                weight_norm + 1e-8
-            )
+            comp_mse = torch.mean(compensation_error**2)
+            comp_mae = torch.mean(torch.abs(compensation_error))
+            comp_relative_error = torch.norm(compensation_error) / (weight_norm + 1e-8)
 
-            # Error reduction metrics
+            # Error reduction metrics (GPU에서 계산)
             mse_reduction = (quant_mse - comp_mse) / (quant_mse + 1e-8)
             mae_reduction = (quant_mae - comp_mae) / (quant_mae + 1e-8)
             relative_error_reduction = (quant_relative_error - comp_relative_error) / (
@@ -51,46 +53,29 @@ def calculate_layer_errors(original_weight, quantized_weight, low_rank_weight=No
 
             errors.update(
                 {
-                    "compensation_mse": comp_mse,
-                    "compensation_mae": comp_mae,
-                    "compensation_relative_error": comp_relative_error,
-                    "mse_reduction_ratio": mse_reduction,
-                    "mae_reduction_ratio": mae_reduction,
-                    "relative_error_reduction_ratio": relative_error_reduction,
+                    "compensation_mse": comp_mse.item(),
+                    "compensation_mae": comp_mae.item(),
+                    "compensation_relative_error": comp_relative_error.item(),
+                    "mse_reduction_ratio": mse_reduction.item(),
+                    "mae_reduction_ratio": mae_reduction.item(),
+                    "relative_error_reduction_ratio": relative_error_reduction.item(),
                 }
             )
 
         return errors
 
 
-def calculate_layer_error_task(args):
-    """병렬 처리를 위한 레이어 에러 계산 헬퍼 함수"""
-    layer_name, original_weight, quantized_weight, low_rank_weight = args
+def extract_weights_batch_gpu(model, w_bits, batch_size=8):
+    """GPU에서 배치 단위로 weights 추출 및 에러 계산"""
+    layer_errors = {}
+    layer_data = []
 
-    # GPU 메모리 효율성을 위해 CPU에서 계산
-    if original_weight.is_cuda:
-        original_weight = original_weight.cpu()
-    if quantized_weight.is_cuda:
-        quantized_weight = quantized_weight.cpu()
-    if low_rank_weight is not None and low_rank_weight.is_cuda:
-        low_rank_weight = low_rank_weight.cpu()
-
-    errors = calculate_layer_errors(original_weight, quantized_weight, low_rank_weight)
-    return layer_name, errors
-
-
-def extract_weights_from_model_parallel(model, w_bits):
-    """모델에서 original, quantized, low-rank weights 추출 (병렬화)"""
-
-    # 먼저 모든 레이어 정보를 수집
-    layer_tasks = []
-
+    # 모든 레이어 정보를 먼저 수집
     for name, module in model.named_modules():
         if isinstance(module, QuantizeLinear):
-            # Get original weight
             original_weight = module.weight.detach().clone()
 
-            # Calculate quantized weight
+            # Calculate quantized weight on GPU
             if w_bits < 16:
                 quantized_weight = LinearQuant(
                     original_weight,
@@ -110,37 +95,91 @@ def extract_weights_from_model_parallel(model, w_bits):
                     * module.low_rank_alpha
                 )
 
-            layer_tasks.append(
+            layer_data.append(
                 (name, original_weight, quantized_weight, low_rank_weight)
             )
 
-    # 병렬로 에러 계산
-    layer_errors = {}
-    with ThreadPoolExecutor(
-        max_workers=min(len(layer_tasks), mp.cpu_count())
-    ) as executor:
-        results = list(
-            tqdm(
-                executor.map(calculate_layer_error_task, layer_tasks),
-                total=len(layer_tasks),
-                desc="Calculating layer errors",
-            )
-        )
+    for i in tqdm(
+        range(0, len(layer_data), batch_size), desc="Processing layers on GPU"
+    ):
+        batch = layer_data[i : i + batch_size]
 
-    for layer_name, errors in results:
-        layer_errors[layer_name] = errors
+        # 배치를 GPU로 이동하고 병렬 계산
+        batch_errors = []
+
+        for name, original_weight, quantized_weight, low_rank_weight in batch:
+            # GPU에서 에러 계산
+            errors = calculate_layer_errors_gpu(
+                original_weight, quantized_weight, low_rank_weight
+            )
+            batch_errors.append((name, errors))
+
+        # 결과 저장
+        for name, errors in batch_errors:
+            layer_errors[name] = errors
+
+        # GPU 메모리 정리
+        torch.cuda.empty_cache()
 
     return layer_errors
 
 
-def load_and_analyze_model_task(args):
-    """단일 모델 설정에 대한 완전한 분석 (병렬 처리용)"""
+def calculate_quantized_weights_gpu_batch(model, w_bits):
+    """GPU에서 배치로 quantized weights 계산"""
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = model.to(device)
+
+    quantized_weights = {}
+    named_params = dict(model.named_parameters())
+
+    # weight parameters를 배치로 처리
+    weight_params = [
+        (name, param)
+        for name, param in named_params.items()
+        if "weight" in name
+        and not any(x in name for x in ["scale", "zero_point", "low_rank"])
+    ]
+
+    for name, weight_param in tqdm(
+        weight_params, desc="Calculating quantized weights on GPU"
+    ):
+        scale_name = name.replace("weight", "weight_scale")
+        zero_point_name = name.replace("weight", "weight_zero_point")
+
+        if scale_name in named_params and zero_point_name in named_params:
+            weight_scale = named_params[scale_name]
+            weight_zero_point = named_params[zero_point_name]
+
+            # GPU에서 quantization 계산
+            quantized_weight = LinearQuant(
+                weight_param.to(device),
+                weight_scale.to(device),
+                weight_zero_point.to(device),
+                w_bits,
+                layerwise=False,
+            ).to(weight_param.dtype)
+
+            quantized_weights[name] = quantized_weight
+
+    return quantized_weights
+
+
+def load_and_analyze_model_task_gpu(args):
+    """GPU 활용한 단일 모델 설정 분석"""
     model_name, w_bits, low_rank_dim = args
 
     try:
-        print(f"Processing {w_bits}-bit, rank-{low_rank_dim}")
+        print(f"Processing {w_bits}-bit, rank-{low_rank_dim} on GPU")
 
-        # Load model with specific configuration
+        # GPU 메모리 상태 확인
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            print(
+                f"GPU memory before loading: {torch.cuda.memory_allocated()/1024**3:.2f} GB"
+            )
+
+        # Load model on GPU
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         model = FluxTransformer2DModelQuant.from_pretrained(
             pretrained_model_name_or_path=model_name,
             subfolder="transformer",
@@ -151,44 +190,61 @@ def load_and_analyze_model_task(args):
             use_low_rank=low_rank_dim > 0,
             low_rank_dim=low_rank_dim if low_rank_dim > 0 else None,
             low_rank_alpha=1.0,
-        )
+        ).to(device)
+
+        if torch.cuda.is_available():
+            print(
+                f"GPU memory after loading: {torch.cuda.memory_allocated()/1024**3:.2f} GB"
+            )
 
         # Initialize quantization parameters
         if w_bits <= 8:
             from generate_images import calculate_scale_and_zero_point
-            from concurrent.futures import ThreadPoolExecutor
 
             weight_scale_dict = {}
             scale_tasks = []
             named_params = dict(model.named_parameters())
 
+            # GPU에서 스케일 계산을 위한 태스크 준비
             for name, param in named_params.items():
                 if "weight_scale" in name:
                     weight_name = name.replace("weight_scale", "weight")
                     weight_param = named_params.get(weight_name, None)
                     if weight_param is not None:
-                        scale_tasks.append((name, weight_param, w_bits))
+                        scale_tasks.append((name, weight_param.to(device), w_bits))
 
-            # 스케일 계산도 병렬화
-            with ThreadPoolExecutor(max_workers=mp.cpu_count()) as executor:
+            # GPU에서 병렬 스케일 계산
+            with ThreadPoolExecutor(max_workers=4) as executor:  # GPU 메모리 제한
                 scale_results = list(
-                    executor.map(calculate_scale_and_zero_point, scale_tasks)
+                    tqdm(
+                        executor.map(calculate_scale_and_zero_point, scale_tasks),
+                        total=len(scale_tasks),
+                        desc=f"Calculating scales on GPU for {w_bits}-bit",
+                    )
                 )
 
             for scale_name, scale, zero_point_name, zero_point in scale_results:
-                weight_scale_dict[scale_name] = scale
-                weight_scale_dict[zero_point_name] = zero_point
+                weight_scale_dict[scale_name] = scale.to(device)
+                weight_scale_dict[zero_point_name] = zero_point.to(device)
 
             model.load_state_dict(weight_scale_dict, assign=True, strict=False)
 
-            # Initialize low-rank branch if enabled
+            # GPU에서 low-rank 초기화
             if low_rank_dim > 0:
                 from generate_images import initialize_low_rank_with_svd_parallel
 
+                print(f"Initializing low-rank on GPU for rank-{low_rank_dim}")
                 initialize_low_rank_with_svd_parallel(model, w_bits, low_rank_dim)
 
-        # Extract and analyze errors with parallelization
-        layer_errors = extract_weights_from_model_parallel(model, w_bits)
+        # GPU에서 배치 단위로 에러 분석
+        layer_errors = extract_weights_batch_gpu(
+            model, w_bits, batch_size=4
+        )  # 메모리에 따라 조정
+
+        if torch.cuda.is_available():
+            print(
+                f"GPU memory after analysis: {torch.cuda.memory_allocated()/1024**3:.2f} GB"
+            )
 
         # Clean up
         del model
@@ -199,129 +255,140 @@ def load_and_analyze_model_task(args):
 
     except Exception as e:
         print(f"Error processing {w_bits}-bit, rank-{low_rank_dim}: {str(e)}")
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         return f"{w_bits}bit", f"rank{low_rank_dim}", {}
 
 
-def analyze_quantization_errors_parallel(
-    model_name, w_bits_list=[8, 4, 2], low_rank_dims=[0, 8, 16, 32]
+def analyze_quantization_errors_gpu_optimized(
+    model_name, w_bits_list=[8, 4, 2], low_rank_dims=[0, 8, 16]
 ):
-    """다양한 설정에서 quantization error 분석 (완전 병렬화)"""
+    """GPU 최적화된 quantization error 분석"""
 
-    # 모든 조합의 태스크 생성
     analysis_tasks = []
     for w_bits in w_bits_list:
         for low_rank_dim in low_rank_dims:
             analysis_tasks.append((model_name, w_bits, low_rank_dim))
 
-    print(f"Starting parallel analysis of {len(analysis_tasks)} configurations...")
+    print(f"Starting GPU-optimized analysis of {len(analysis_tasks)} configurations...")
 
     results = {}
 
-    # GPU 메모리 제한으로 인해 sequential하게 처리하되, 내부적으로는 병렬화
-    # GPU가 여러 개 있다면 ProcessPoolExecutor를 사용할 수 있음
-    for model_name, w_bits, low_rank_dim in tqdm(
-        analysis_tasks, desc="Processing configurations"
-    ):
-        bit_config, rank_config, layer_errors = load_and_analyze_model_task(
-            (model_name, w_bits, low_rank_dim)
-        )
+    # GPU 메모리 최적화를 위해 한 번에 하나씩 처리
+    for task in tqdm(analysis_tasks, desc="Processing configurations on GPU"):
+        bit_config, rank_config, layer_errors = load_and_analyze_model_task_gpu(task)
 
         if bit_config not in results:
             results[bit_config] = {}
         results[bit_config][rank_config] = layer_errors
 
+        # 각 설정 후 메모리 정리
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        gc.collect()
+
     return results
 
 
-def calculate_statistics_task(args):
-    """통계 계산을 위한 병렬 처리 함수"""
-    bit_config, rank_config, layer_errors = args
-
-    if not layer_errors:
-        return bit_config, rank_config, {}
-
-    # Aggregate statistics across all layers
-    all_quant_mse = [errors["quantization_mse"] for errors in layer_errors.values()]
-    all_quant_mae = [errors["quantization_mae"] for errors in layer_errors.values()]
-    all_quant_rel = [
-        errors["quantization_relative_error"] for errors in layer_errors.values()
-    ]
-
-    stats = {
-        "avg_quantization_mse": np.mean(all_quant_mse),
-        "std_quantization_mse": np.std(all_quant_mse),
-        "avg_quantization_mae": np.mean(all_quant_mae),
-        "std_quantization_mae": np.std(all_quant_mae),
-        "avg_quantization_relative_error": np.mean(all_quant_rel),
-        "std_quantization_relative_error": np.std(all_quant_rel),
-        "num_layers": len(layer_errors),
-    }
-
-    # Low-rank compensation statistics if available
-    comp_mse_list = [
-        errors.get("compensation_mse")
-        for errors in layer_errors.values()
-        if "compensation_mse" in errors
-    ]
-
-    if comp_mse_list and all(x is not None for x in comp_mse_list):
-        mse_reductions = [
-            errors["mse_reduction_ratio"]
-            for errors in layer_errors.values()
-            if "mse_reduction_ratio" in errors
-        ]
-        mae_reductions = [
-            errors["mae_reduction_ratio"]
-            for errors in layer_errors.values()
-            if "mae_reduction_ratio" in errors
-        ]
-        rel_reductions = [
-            errors["relative_error_reduction_ratio"]
-            for errors in layer_errors.values()
-            if "relative_error_reduction_ratio" in errors
-        ]
-
-        stats.update(
-            {
-                "avg_compensation_mse": np.mean(comp_mse_list),
-                "std_compensation_mse": np.std(comp_mse_list),
-                "avg_mse_reduction_ratio": np.mean(mse_reductions),
-                "std_mse_reduction_ratio": np.std(mse_reductions),
-                "avg_mae_reduction_ratio": np.mean(mae_reductions),
-                "std_mae_reduction_ratio": np.std(mae_reductions),
-                "avg_relative_error_reduction_ratio": np.mean(rel_reductions),
-                "std_relative_error_reduction_ratio": np.std(rel_reductions),
-            }
-        )
-
-    return bit_config, rank_config, stats
-
-
-def summarize_results_parallel(results):
-    """결과 요약 및 통계 (병렬화)"""
-
-    # 통계 계산 태스크 준비
-    stat_tasks = []
-    for bit_config, rank_configs in results.items():
-        for rank_config, layer_errors in rank_configs.items():
-            stat_tasks.append((bit_config, rank_config, layer_errors))
-
-    # 병렬로 통계 계산
+def calculate_statistics_gpu_batch(results):
+    """GPU에서 배치로 통계 계산"""
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     summary = {}
-    with ThreadPoolExecutor(max_workers=mp.cpu_count()) as executor:
-        stat_results = list(
-            tqdm(
-                executor.map(calculate_statistics_task, stat_tasks),
-                total=len(stat_tasks),
-                desc="Calculating statistics",
-            )
-        )
 
-    # 결과를 dictionary로 구성
-    for bit_config, rank_config, stats in stat_results:
-        if bit_config not in summary:
-            summary[bit_config] = {}
-        summary[bit_config][rank_config] = stats
+    for bit_config, rank_configs in results.items():
+        summary[bit_config] = {}
+
+        for rank_config, layer_errors in tqdm(
+            rank_configs.items(), desc=f"Calculating stats for {bit_config}"
+        ):
+            if not layer_errors:
+                summary[bit_config][rank_config] = {}
+                continue
+
+            # GPU에서 텐서로 변환하여 배치 계산
+            all_quant_mse = torch.tensor(
+                [errors["quantization_mse"] for errors in layer_errors.values()],
+                device=device,
+            )
+            all_quant_mae = torch.tensor(
+                [errors["quantization_mae"] for errors in layer_errors.values()],
+                device=device,
+            )
+            all_quant_rel = torch.tensor(
+                [
+                    errors["quantization_relative_error"]
+                    for errors in layer_errors.values()
+                ],
+                device=device,
+            )
+
+            # GPU에서 통계 계산
+            stats = {
+                "avg_quantization_mse": torch.mean(all_quant_mse).item(),
+                "std_quantization_mse": torch.std(all_quant_mse).item(),
+                "avg_quantization_mae": torch.mean(all_quant_mae).item(),
+                "std_quantization_mae": torch.std(all_quant_mae).item(),
+                "avg_quantization_relative_error": torch.mean(all_quant_rel).item(),
+                "std_quantization_relative_error": torch.std(all_quant_rel).item(),
+                "num_layers": len(layer_errors),
+            }
+
+            # Low-rank compensation statistics
+            comp_mse_list = [
+                errors.get("compensation_mse")
+                for errors in layer_errors.values()
+                if "compensation_mse" in errors
+            ]
+
+            if comp_mse_list and all(x is not None for x in comp_mse_list):
+                comp_mse_tensor = torch.tensor(comp_mse_list, device=device)
+                mse_reductions = torch.tensor(
+                    [
+                        errors["mse_reduction_ratio"]
+                        for errors in layer_errors.values()
+                        if "mse_reduction_ratio" in errors
+                    ],
+                    device=device,
+                )
+                mae_reductions = torch.tensor(
+                    [
+                        errors["mae_reduction_ratio"]
+                        for errors in layer_errors.values()
+                        if "mae_reduction_ratio" in errors
+                    ],
+                    device=device,
+                )
+                rel_reductions = torch.tensor(
+                    [
+                        errors["relative_error_reduction_ratio"]
+                        for errors in layer_errors.values()
+                        if "relative_error_reduction_ratio" in errors
+                    ],
+                    device=device,
+                )
+
+                stats.update(
+                    {
+                        "avg_compensation_mse": torch.mean(comp_mse_tensor).item(),
+                        "std_compensation_mse": torch.std(comp_mse_tensor).item(),
+                        "avg_mse_reduction_ratio": torch.mean(mse_reductions).item(),
+                        "std_mse_reduction_ratio": torch.std(mse_reductions).item(),
+                        "avg_mae_reduction_ratio": torch.mean(mae_reductions).item(),
+                        "std_mae_reduction_ratio": torch.std(mae_reductions).item(),
+                        "avg_relative_error_reduction_ratio": torch.mean(
+                            rel_reductions
+                        ).item(),
+                        "std_relative_error_reduction_ratio": torch.std(
+                            rel_reductions
+                        ).item(),
+                    }
+                )
+
+            summary[bit_config][rank_config] = stats
+
+    # GPU 메모리 정리
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
     return summary
 
@@ -347,6 +414,8 @@ def create_plot_task(args):
             comp_mse = []
 
             for rank_config, stats in rank_data.items():
+                if not stats:  # 빈 stats 체크
+                    continue
                 rank_num = int(rank_config.replace("rank", ""))
                 ranks.append(rank_num)
                 quant_mse.append(stats["avg_quantization_mse"])
@@ -356,28 +425,29 @@ def create_plot_task(args):
                 else:
                     comp_mse.append(stats["avg_quantization_mse"])
 
-            ax.plot(
-                ranks,
-                quant_mse,
-                "o-",
-                label="Quantization Only",
-                color="red",
-                linewidth=2,
-            )
-            ax.plot(
-                ranks,
-                comp_mse,
-                "s-",
-                label="With Low-rank Compensation",
-                color="blue",
-                linewidth=2,
-            )
-            ax.set_xlabel("Low-rank Dimension")
-            ax.set_ylabel("Average MSE")
-            ax.set_title(f"{bit_config} Quantization Error")
-            ax.legend()
-            ax.grid(True, alpha=0.3)
-            ax.set_yscale("log")
+            if ranks:  # 데이터가 있을 때만 플롯
+                ax.plot(
+                    ranks,
+                    quant_mse,
+                    "o-",
+                    label="Quantization Only",
+                    color="red",
+                    linewidth=2,
+                )
+                ax.plot(
+                    ranks,
+                    comp_mse,
+                    "s-",
+                    label="With Low-rank Compensation",
+                    color="blue",
+                    linewidth=2,
+                )
+                ax.set_xlabel("Low-rank Dimension")
+                ax.set_ylabel("Average MSE")
+                ax.set_title(f"{bit_config} Quantization Error")
+                ax.legend()
+                ax.grid(True, alpha=0.3)
+                ax.set_yscale("log")
 
         plt.tight_layout()
         plt.savefig(output_dir / "mse_comparison.png", dpi=300, bbox_inches="tight")
@@ -392,6 +462,8 @@ def create_plot_task(args):
             reductions = []
 
             for rank_config, stats in rank_data.items():
+                if not stats:  # 빈 stats 체크
+                    continue
                 rank_num = int(rank_config.replace("rank", ""))
                 if rank_num > 0 and "avg_mse_reduction_ratio" in stats:
                     ranks.append(rank_num)
@@ -472,15 +544,27 @@ def save_results_parallel(results, summary, output_dir):
 def main():
     model_name = "black-forest-labs/FLUX.1-dev"
 
-    print("Starting parallel quantization error analysis...")
-    results = analyze_quantization_errors_parallel(
+    # GPU 상태 확인
+    if torch.cuda.is_available():
+        print(f"Using GPU: {torch.cuda.get_device_name()}")
+        print(
+            f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB"
+        )
+        print(
+            f"Available GPU Memory: {(torch.cuda.get_device_properties(0).total_memory - torch.cuda.memory_allocated()) / 1024**3:.1f} GB"
+        )
+    else:
+        print("GPU not available, using CPU")
+
+    print("Starting GPU-optimized quantization error analysis...")
+    results = analyze_quantization_errors_gpu_optimized(
         model_name,
-        w_bits_list=[8, 4, 2],  # 더 빠른 테스트를 위해 줄임
-        low_rank_dims=[0, 8, 16],  # 더 빠른 테스트를 위해 줄임
+        w_bits_list=[8, 4],  # 시작은 작게
+        low_rank_dims=[0, 8, 16],  # 시작은 작게
     )
 
-    print("\nSummarizing results with parallel processing...")
-    summary = summarize_results_parallel(results)
+    print("\nCalculating statistics on GPU...")
+    summary = calculate_statistics_gpu_batch(results)
 
     # Save results in parallel
     output_dir = Path("output/error_analysis")
@@ -489,7 +573,7 @@ def main():
 
     # Print summary
     print("\n" + "=" * 80)
-    print("QUANTIZATION ERROR ANALYSIS SUMMARY")
+    print("QUANTIZATION ERROR ANALYSIS SUMMARY (GPU-Optimized)")
     print("=" * 80)
 
     for bit_config, rank_data in summary.items():
@@ -497,6 +581,8 @@ def main():
         print("-" * 50)
 
         for rank_config, stats in rank_data.items():
+            if not stats:  # 빈 stats 체크
+                continue
             rank_num = int(rank_config.replace("rank", ""))
             print(f"  Rank {rank_num}:")
             print(f"    Avg Quantization MSE: {stats['avg_quantization_mse']:.6e}")
@@ -512,10 +598,12 @@ def main():
     print("\nGenerating plots in parallel...")
     plot_error_analysis_parallel(summary)
 
-    print(f"\nAnalysis complete! Results saved to {output_dir}")
+    print(f"\nGPU-optimized analysis complete! Results saved to {output_dir}")
+
+    # 최종 GPU 메모리 상태
+    if torch.cuda.is_available():
+        print(f"Final GPU memory usage: {torch.cuda.memory_allocated()/1024**3:.2f} GB")
 
 
 if __name__ == "__main__":
-    # 멀티프로세싱 지원을 위한 설정
-    mp.set_start_method("spawn", force=True)
     main()
