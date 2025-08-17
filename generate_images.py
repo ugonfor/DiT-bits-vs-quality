@@ -241,7 +241,7 @@ def initialize_low_rank_with_svd_parallel(model, w_bits, low_rank_dim):
 
     # Process SVD tasks in parallel with limited workers
     with ThreadPoolExecutor(
-        max_workers=min(4, len(svd_tasks))  # GPU 메모리를 고려해서 worker 수 제한
+        max_workers=min(32, len(svd_tasks))  # GPU 메모리를 고려해서 worker 수 제한
     ) as executor:
         svd_results = list(
             tqdm(
@@ -363,6 +363,7 @@ def main(prompt):
     for w_bits in [8, 4, 3, 2, 1]:
         for low_rank in [0, 4, 8, 16, 32, 64]:
             # Clear cache before loading new model
+            pipe.transformer.to("cpu")
             torch.cuda.empty_cache()
 
             # Load new model
