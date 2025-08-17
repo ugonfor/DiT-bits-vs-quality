@@ -241,7 +241,7 @@ def initialize_low_rank_with_svd_parallel(model, w_bits, low_rank_dim):
 
     # Process SVD tasks in parallel with limited workers
     with ThreadPoolExecutor(
-        max_workers=min(32, len(svd_tasks))  # GPU 메모리를 고려해서 worker 수 제한
+        max_workers=min(8, len(svd_tasks))  # GPU 메모리를 고려해서 worker 수 제한
     ) as executor:
         svd_results = list(
             tqdm(
