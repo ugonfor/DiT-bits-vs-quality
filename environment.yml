@@ -11,7 +11,7 @@ dependencies:
       - torch==2.5.0 --index-url https://download.pytorch.org/whl/cu124
       - torchvision==0.20.0 --index-url https://download.pytorch.org/whl/cu124
       - torchaudio==2.5.0 --index-url https://download.pytorch.org/whl/cu124
-      
+
       - diffusers==0.34.0
       - transformers==4.41.0
       - accelerate==0.29.3
@@ -25,3 +25,4 @@ dependencies:
       - bitsandbytes
       - image-reward
       - clip
+      - pre-commit

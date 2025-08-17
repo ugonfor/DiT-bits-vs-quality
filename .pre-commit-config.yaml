@@ -1,0 +1,51 @@
+# .pre-commit-config.yaml
+# 공통: 거의 모든 레포에서 쓰이는 안전 훅 모음
+ci:
+  autoupdate_schedule: monthly
+
+default_stages: [commit]  # 기본은 pre-commit 훅에서 동작
+exclude: |
+  ^(node_modules/|\.venv/|venv/|dist/|build/|\.tox/|\.mypy_cache/|\.pytest_cache/|coverage/)
+
+repos:
+  # 1) Universals: 파일 끝 개행, 공백, 포맷 검증 등
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.6.0
+    hooks:
+      - id: trailing-whitespace
+        args: [--markdown-linebreak-ext=md]
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-toml
+      - id: check-json
+      - id: detect-private-key
+      - id: check-merge-conflict
+      - id: check-added-large-files
+        args: ['--maxkb=1024']  # 1MB 이상 커밋 방지
+
+  # 2A) Python (요즘 대세): Ruff로 포맷(+정렬) + 린트/자동수정
+  #    -> 이 블록을 활성화하고, 아래 2B(Black/isort)는 주석 유지하세요.
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.6.3
+    hooks:
+      - id: ruff
+        # 자동 고침(fix) + 변경된 파일만 빠르게 검사
+        args: [--fix]
+      - id: ruff-format  # 포맷터 (Black 대체)
+
+  # 2B) Python (클래식): Black + isort  ← Ruff 대신 이 조합을 쓰고 싶으면 위 2A를 주석 처리하고 아래 주석 해제
+  # - repo: https://github.com/psf/black
+  #   rev: 24.8.0
+  #   hooks:
+  #     - id: black
+  # - repo: https://github.com/PyCQA/isort
+  #   rev: 5.13.2
+  #   hooks:
+  #     - id: isort
+
+  # (선택) Markdown 표/링크 체크 등 문서 품질 훅을 원하면 추가
+  # - repo: https://github.com/executablebooks/mdformat
+  #   rev: 0.7.17
+  #   hooks:
+  #     - id: mdformat
+  #       additional_dependencies: [mdformat-gfm]  # GitHub Flavored Markdown
