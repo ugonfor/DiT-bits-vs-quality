@@ -86,6 +86,11 @@ def initialize_low_rank_svd_task(args):
     low_rank_A_name, original_weight, quantized_weight, low_rank_dim = args
 
     with torch.no_grad():
+        # Move tensors to GPU if available and they're not already there
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        original_weight = original_weight.to(device)
+        quantized_weight = quantized_weight.to(device)
+
         # Calculate residual
         residual = original_weight - quantized_weight
 
@@ -94,7 +99,7 @@ def initialize_low_rank_svd_task(args):
         if residual.dtype == torch.bfloat16:
             residual = residual.float()
 
-        # SVD decomposition of residual
+        # SVD decomposition of residual (on GPU)
         U, S, Vt = torch.linalg.svd(residual, full_matrices=False)
 
         # Take top-k components
@@ -138,6 +143,12 @@ def initialize_low_rank_svd_task(args):
 def calculate_quantized_weight_task(args):
     """병렬 처리를 위한 quantized weight 계산 헬퍼 함수"""
     low_rank_A_name, original_weight, weight_scale, weight_zero_point, w_bits = args
+
+    # Move tensors to GPU if available
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    original_weight = original_weight.to(device)
+    weight_scale = weight_scale.to(device)
+    weight_zero_point = weight_zero_point.to(device)
 
     # Calculate quantized weight
     from models.utils_quant import LinearQuant
