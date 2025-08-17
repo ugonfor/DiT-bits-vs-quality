@@ -26,3 +26,4 @@ dependencies:
       - image-reward
       - clip
       - pre-commit
+      - matplotlib
