@@ -135,12 +135,30 @@ def initialize_low_rank_svd_task(args):
         return low_rank_A_name, A_init, low_rank_B_name, B_init
 
 
+def calculate_quantized_weight_task(args):
+    """병렬 처리를 위한 quantized weight 계산 헬퍼 함수"""
+    low_rank_A_name, original_weight, weight_scale, weight_zero_point, w_bits = args
+
+    # Calculate quantized weight
+    from models.utils_quant import LinearQuant
+
+    quantized_weight = LinearQuant(
+        original_weight,
+        weight_scale,
+        weight_zero_point,
+        w_bits,
+        layerwise=False,
+    ).to(original_weight.dtype)
+
+    return low_rank_A_name, original_weight, quantized_weight
+
+
 def initialize_low_rank_with_svd_parallel(model, w_bits, low_rank_dim):
     """병렬 SVD를 사용해서 low-rank branch를 초기화"""
     named_params = dict(model.named_parameters())
 
-    # Prepare tasks for parallel processing
-    svd_tasks = []
+    # Prepare tasks for parallel quantized weight calculation
+    quantize_tasks = []
     for name, param in named_params.items():
         if "low_rank_A" in name:
             weight_name = name.replace("low_rank_A", "weight")
@@ -155,20 +173,28 @@ def initialize_low_rank_with_svd_parallel(model, w_bits, low_rank_dim):
                 x is not None
                 for x in [original_weight, weight_scale, weight_zero_point]
             ):
-                # Calculate quantized weight
-                from models.utils_quant import LinearQuant
-
-                quantized_weight = LinearQuant(
-                    original_weight,
-                    weight_scale,
-                    weight_zero_point,
-                    w_bits,
-                    layerwise=False,
-                ).to(original_weight.dtype)
-
-                svd_tasks.append(
-                    (name, original_weight, quantized_weight, low_rank_dim)
+                quantize_tasks.append(
+                    (name, original_weight, weight_scale, weight_zero_point, w_bits)
                 )
+
+    # Process quantized weight calculation in parallel
+    with ThreadPoolExecutor(
+        max_workers=min(len(quantize_tasks), mp.cpu_count())
+    ) as executor:
+        quantize_results = list(
+            tqdm(
+                executor.map(calculate_quantized_weight_task, quantize_tasks),
+                total=len(quantize_tasks),
+                desc="Calculating quantized weights",
+            )
+        )
+
+    # Prepare SVD tasks
+    svd_tasks = []
+    for low_rank_A_name, original_weight, quantized_weight in quantize_results:
+        svd_tasks.append(
+            (low_rank_A_name, original_weight, quantized_weight, low_rank_dim)
+        )
 
     # Process SVD tasks in parallel
     with ThreadPoolExecutor(
