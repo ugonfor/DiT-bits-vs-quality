@@ -358,14 +358,12 @@ def main(prompt):
     generate_images(pipe, prompt, samples_dir / "bf16", seed=42)
     print(f"Samples saved to '{samples_dir / 'bf16'}'")
 
+    pipe.transformer.to("cpu")
+    del pipe.transformer
     torch.cuda.empty_cache()
 
     for w_bits in [8, 4, 3, 2, 1]:
         for low_rank in [0, 4, 8, 16, 32, 64]:
-            # Clear cache before loading new model
-            pipe.transformer.to("cpu")
-            torch.cuda.empty_cache()
-
             # Load new model
             pipe.transformer = load_quantized_model(
                 model_name,
@@ -382,6 +380,7 @@ def main(prompt):
             )
 
             # Clean up after each iteration
+            pipe.transformer.to("cpu")
             del pipe.transformer
             torch.cuda.empty_cache()
 
