@@ -137,23 +137,17 @@ class QuantizeLinear(nn.Linear):
     # Quant init / helpers
     # -----------------------------
     @torch.no_grad()
-    def initialize_quant_params(self, eps: float = 1e-8):
+    def _compute_qparams_from_tensor(self, calib_W: torch.Tensor, eps: float = 1e-8):
         """
-        Min-Max affine quant 초기화.
-        - use_low_rank=True, w_bits<=8 => (W - α·A@B) 기준
-        - 그 외 => W 기준
+        주어진 텐서(calib_W)를 기준으로 min-max affine 양자화 파라미터를 계산해 반환.
+        self.weight_layerwise에 따라 layerwise / per-channel 수행.
+        반환값: (scale, zero_point)  # 둘 다 calib_W와 같은 device/dtype로
         """
         if self.w_bits >= 16:
-            return  # 양자화 안 함
-
-        if self.use_low_rank and self.w_bits <= 8:
-            LR = torch.matmul(self.low_rank_A, self.low_rank_B)
-            calib_W = self.weight - self.low_rank_alpha * LR
-        else:
-            calib_W = self.weight
+            return None, None  # 양자화 미사용
 
         qmin, qmax = 0.0, float(2 ** self.w_bits - 1)
-        device, dtype = self.weight.device, self.weight.dtype
+        device, dtype = calib_W.device, calib_W.dtype
 
         if self.weight_layerwise:
             w_min = torch.min(calib_W)
@@ -161,29 +155,130 @@ class QuantizeLinear(nn.Linear):
             w_range = torch.clamp(w_max - w_min, min=eps)
             scale = (w_range / (qmax - qmin)).to(dtype).to(device)
             zero_point = torch.clamp(torch.round(qmin - w_min / scale), qmin, qmax).to(dtype).to(device)
-            self.weight_scale.data = scale.view(1, 1)
-            self.weight_zero_point.data = zero_point.view(1, 1)
+            return scale.view(1, 1), zero_point.view(1, 1)
         else:
+            # out-channel(행)별 min-max
             w_min = torch.min(calib_W, dim=1, keepdim=True).values
             w_max = torch.max(calib_W, dim=1, keepdim=True).values
-            w_range = torch.clamp(w_max - w_min, min=1e-8)
+            w_range = torch.clamp(w_max - w_min, min=eps)
             scale = (w_range / (qmax - qmin)).to(dtype).to(device)
             zero_point = torch.clamp(torch.round(qmin - w_min / scale), qmin, qmax).to(dtype).to(device)
-            self.weight_scale.data = scale
-            self.weight_zero_point.data = zero_point
+            return scale, zero_point
 
     @torch.no_grad()
-    def svd_init_low_rank(self, reduced_rank: int = None):
+    def initialize_quant_params(self, eps: float = 1e-8):
+        """
+        (LoftQ 호환) Min-Max affine 초기화.
+        - use_low_rank=True, w_bits<=8 => (W - α·A@B) 기준으로 파라미터 설정
+        - 그 외 => W 기준
+        """
+        if self.w_bits >= 16:
+            return  # 양자화 안 함
+
+        if self.use_low_rank and self.w_bits <= 8:
+            LR = torch.matmul(self.low_rank_A, self.low_rank_B) * self.low_rank_alpha
+            calib_W = self.weight - LR
+        else:
+            calib_W = self.weight
+
+        scale, zero_point = self._compute_qparams_from_tensor(calib_W, eps=eps)
+        # 파라미터 텐서에 반영
+        self.weight_scale.data.copy_(scale)
+        self.weight_zero_point.data.copy_(zero_point)
+
+    @torch.no_grad()
+    def svd_init_low_rank(self, reduced_rank: int = None, eps: float = 1e-8):
+        """
+        [LoftQ 스타일 SVD 초기화(단일 스텝)]
+        Δ(=αAB)=0에서 시작해:
+          1) W 기준으로 양자화 파라미터 설정
+          2) base = Q(W)  # dequant 포함
+          3) E = W - base
+          4) E의 랭크-r SVD로 A,B 초기화
+        """
         if not self.use_low_rank:
             raise RuntimeError("use_low_rank=False; low-rank branch not enabled.")
         rank = reduced_rank if reduced_rank is not None else self.low_rank_dim
-        L, R = low_rank_decomposition(self.weight, reduced_rank=rank)
+
+        # w_bits>=16이면 그냥 W의 랭크-r SVD로
+        if self.w_bits >= 16:
+            L, R = low_rank_decomposition(self.weight, reduced_rank=rank)
+            self.low_rank_A.copy_(L)
+            self.low_rank_B.copy_(R)
+            return
+
+        # 1) qparams: Δ=0 가정
+        scale, zero_point = self._compute_qparams_from_tensor(self.weight, eps=eps)
+        self.weight_scale.data.copy_(scale)
+        self.weight_zero_point.data.copy_(zero_point)
+
+        # 2) base = Q(W)
+        base = LinearQuant(self.weight, self.weight_scale, self.weight_zero_point,
+                           self.w_bits, self.weight_layerwise).to(self.weight.dtype)
+
+        # 3) E = W - base
+        E = (self.weight - base).to(self.weight.dtype)
+
+        # 4) rank-r SVD(E)
+        L, R = low_rank_decomposition(E, reduced_rank=rank)
         if L.shape != self.low_rank_A.shape or R.shape != self.low_rank_B.shape:
             raise RuntimeError(
                 f"SVD shapes {L.shape},{R.shape} do not match A,B shapes {self.low_rank_A.shape},{self.low_rank_B.shape}"
             )
         self.low_rank_A.copy_(L)
         self.low_rank_B.copy_(R)
+
+    @torch.no_grad()
+    def loftq_init(self, iters: int = 10, reduced_rank: int = None, eps: float = 1e-8):
+        """
+        LoftQ 교대 최적화 초기화:
+          반복 t=1..K:
+            1) calib_W_t = W - α A_t B_t
+            2) (calib_W_t)로 qparams 재추정
+            3) base_t = Q(calib_W_t)
+            4) E_t = W - base_t
+            5) (rank-r) SVD(E_t) -> A_{t+1}, B_{t+1}
+        최종적으로 qparams는 마지막 calib_W_K 기준으로, A,B는 E_K의 랭크-r 근사로 설정.
+        """
+        if not self.use_low_rank:
+            raise RuntimeError("use_low_rank=False; low-rank branch not enabled.")
+        rank = reduced_rank if reduced_rank is not None else self.low_rank_dim
+
+        # w_bits>=16이면 양자화가 영향 없으므로 SVD(W)만 수행
+        if self.w_bits >= 16:
+            L, R = low_rank_decomposition(self.weight, reduced_rank=rank)
+            self.low_rank_A.copy_(L)
+            self.low_rank_B.copy_(R)
+            return
+
+        # 초기 Δ=αAB를 0에서 시작하려면 A,B를 0으로 세팅
+        self.low_rank_A.zero_()
+        self.low_rank_B.zero_()
+
+        for _ in range(max(1, int(iters))):
+            # 1) 현재 Δ로 보정한 대상
+            LR = torch.matmul(self.low_rank_A, self.low_rank_B) * self.low_rank_alpha
+            calib_W = (self.weight - LR).to(self.weight.dtype)
+
+            # 2) qparams 재계산
+            scale, zero_point = self._compute_qparams_from_tensor(calib_W, eps=eps)
+            self.weight_scale.data.copy_(scale)
+            self.weight_zero_point.data.copy_(zero_point)
+
+            # 3) base = Q(calib_W)
+            base = LinearQuant(calib_W, self.weight_scale, self.weight_zero_point,
+                               self.w_bits, self.weight_layerwise).to(self.weight.dtype)
+
+            # 4) E = W - base
+            E = (self.weight - base).to(self.weight.dtype)
+
+            # 5) rank-r SVD(E) -> A,B 갱신
+            L, R = low_rank_decomposition(E, reduced_rank=rank)
+            self.low_rank_A.copy_(L)
+            self.low_rank_B.copy_(R)
+
+        # 마지막 반복에서의 qparams가 이미 self.*에 들어가 있음
+        # 최종 효과 가중치: effective_weight()가 Q(W-αAB)+αAB로 복원
 
     # -----------------------------
     # NEW: effective weight + error measurement
@@ -312,20 +407,85 @@ class QuantizeLinear(nn.Linear):
 
         return result
 
-
 if __name__ == "__main__":
-    layer = QuantizeLinear(500, 1000,
-                       w_bits=4, weight_layerwise=False,
-                       use_low_rank=True, low_rank_dim=32, low_rank_alpha=1.0)
-    layer.svd_init_low_rank()          # 선택
-    layer.initialize_quant_params()    # 권장
+    torch.manual_seed(0)
+
+    # -----------------------------
+    # 하이퍼파라미터
+    # -----------------------------
+    in_features = 500
+    out_features = 1000
+    w_bits = 4
+    weight_layerwise = False
+    low_rank_dim = 32
+    low_rank_alpha = 1.0
+    batch_size = 8
+    loftq_iters = 1  # LoftQ 교대 초기화 스텝 수
+
+    # -----------------------------
+    # Low-rank 브랜치 사용 모델
+    # -----------------------------
+    layer = QuantizeLinear(
+        in_features, out_features,
+        w_bits=w_bits,
+        weight_layerwise=weight_layerwise,
+        use_low_rank=True,
+        low_rank_dim=low_rank_dim,
+        low_rank_alpha=low_rank_alpha,
+    )
+    print(f"start LoftQ initialize (iters={loftq_iters})")
+    # LoftQ: Q(W - αAB)와 A,B를 교대로 맞추는 초기화
+    layer.loftq_init(iters=loftq_iters)
 
     # 1) 가중치 기준 오차만
     err_w = layer.quantization_error()
     print(err_w)
 
     # 2) 입력 배치로 출력 오차까지
-    x = torch.randn(8, 500)
+    x = torch.randn(batch_size, in_features)
     err = layer.quantization_error(input_=x, per_channel=True)
-    print(err["weight"]["snr_db"], err["weight"]["mse"],
-        err["output"]["snr_db"], err["output"]["mse"])
+
+    # -----------------------------
+    # (추가) low-rank 사용 vs 미사용 비교
+    # -----------------------------
+    layer_nolr = QuantizeLinear(
+        in_features, out_features,
+        w_bits=w_bits,
+        weight_layerwise=weight_layerwise,
+        use_low_rank=False,           # 비교 대상: low-rank 미사용
+        low_rank_dim=None,
+        low_rank_alpha=1.0,
+    )
+    with torch.no_grad():
+        layer_nolr.weight.copy_(layer.weight)
+        if layer.bias is not None:
+            layer_nolr.bias.copy_(layer.bias)
+    breakpoint()
+
+    # 두 설정 모두 같은 방식으로 양자화 파라미터를 재보정한 뒤 오차 측정
+    # (low-rank 쪽은 initialize_quant_params가 W-αAB 기준으로 재설정)
+    err_lr   = layer.quantization_error(input_=x, per_channel=False, calibrate=True)
+    err_nolr = layer_nolr.quantization_error(input_=x, per_channel=False, calibrate=True)
+
+    def _extract(metrics_dict):
+        return (
+            metrics_dict["weight"]["snr_db"],
+            metrics_dict["weight"]["mse"],
+            metrics_dict["output"]["snr_db"],
+            metrics_dict["output"]["mse"],
+        )
+
+    wsnr_lr, wmse_lr, ysnr_lr, ymse_lr   = _extract(err_lr)
+    wsnr_nl, wmse_nl, ysnr_nl, ymse_nl   = _extract(err_nolr)
+
+    print("\n=== Low-rank 사용 여부 비교 (w_bits = {}, r = {}, alpha = {}) ===".format(
+        w_bits, low_rank_dim, low_rank_alpha
+    ))
+    print(f"{'':12} | {'Weight SNR(dB)':>14} | {'Weight MSE':>12} | {'Output SNR(dB)':>15} | {'Output MSE':>12}")
+    print("-" * 80)
+    print(f"{'low-rank':12} | {wsnr_lr:14.3f} | {wmse_lr:12.6e} | {ysnr_lr:15.3f} | {ymse_lr:12.6e}")
+    print(f"{'no low-rank':12} | {wsnr_nl:14.3f} | {wmse_nl:12.6e} | {ysnr_nl:15.3f} | {ymse_nl:12.6e}")
+
+    # 간단 판정: 출력 SNR이 큰 쪽, 동률이면 출력 MSE가 작은 쪽
+    better = "low-rank" if (ysnr_lr > ysnr_nl or (ysnr_lr == ysnr_nl and ymse_lr < ymse_nl)) else "no low-rank"
+    print(f"-> Better (by output SNR/MSE): {better}")
