@@ -304,6 +304,9 @@ class Attention(nn.Module):
         self.pre_only = pre_only
         self.is_causal = is_causal
         self.w_bits = w_bits
+        self.use_low_rank = use_low_rank
+        self.low_rank_dim = low_rank_dim
+        self.low_rank_alpha = low_rank_alpha
 
         # we make use of this private variable to know whether this class is loaded
         # with an deprecated state dict so that we can convert it on the fly
@@ -940,7 +943,7 @@ class Attention(nn.Module):
             out_features = concatenated_weights.shape[0]
 
             # create a new single projection layer and copy over the weights.
-            self.to_qkv = QuantizeLinear(in_features, out_features, bias=self.use_bias, device=device, dtype=dtype, w_bits=self.w_bits)
+            self.to_qkv = QuantizeLinear(in_features, out_features, bias=self.use_bias, device=device, dtype=dtype, w_bits=self.w_bits, use_low_rank=use_low_rank, low_rank_dim=low_rank_dim, low_rank_alpha=low_rank_alpha)
             self.to_qkv.weight.copy_(concatenated_weights)
             if self.use_bias:
                 concatenated_bias = torch.cat([self.to_q.bias.data, self.to_k.bias.data, self.to_v.bias.data])
@@ -951,7 +954,7 @@ class Attention(nn.Module):
             in_features = concatenated_weights.shape[1]
             out_features = concatenated_weights.shape[0]
 
-            self.to_kv = QuantizeLinear(in_features, out_features, bias=self.use_bias, device=device, dtype=dtype, w_bits=self.w_bits)
+            self.to_kv = QuantizeLinear(in_features, out_features, bias=self.use_bias, device=device, dtype=dtype, w_bits=self.w_bits, use_low_rank=use_low_rank, low_rank_dim=low_rank_dim, low_rank_alpha=low_rank_alpha)
             self.to_kv.weight.copy_(concatenated_weights)
             if self.use_bias:
                 concatenated_bias = torch.cat([self.to_k.bias.data, self.to_v.bias.data])
@@ -970,8 +973,7 @@ class Attention(nn.Module):
             out_features = concatenated_weights.shape[0]
 
             self.to_added_qkv = QuantizeLinear(
-                in_features, out_features, bias=self.added_proj_bias, device=device, dtype=dtype, w_bits=self.w_bits
-            )
+                in_features, out_features, bias=self.added_proj_bias, device=device, dtype=dtype, w_bits=self.w_bits, use_low_rank=use_low_rank, low_rank_dim=low_rank_dim, low_rank_alpha=low_rank_alpha)
             self.to_added_qkv.weight.copy_(concatenated_weights)
             if self.added_proj_bias:
                 concatenated_bias = torch.cat(
@@ -1055,9 +1057,9 @@ class FluxSingleTransformerBlock(nn.Module):
         self.mlp_hidden_dim = int(dim * mlp_ratio)
 
         self.norm = AdaLayerNormZeroSingle(dim, w_bits=w_bits, use_low_rank=use_low_rank, low_rank_dim=low_rank_dim, low_rank_alpha=low_rank_alpha)
-        self.proj_mlp = QuantizeLinear(dim, self.mlp_hidden_dim, w_bits=w_bits, bias=True)
+        self.proj_mlp = QuantizeLinear(dim, self.mlp_hidden_dim, w_bits=w_bits, bias=True, use_low_rank=use_low_rank, low_rank_dim=low_rank_dim, low_rank_alpha=low_rank_alpha)
         self.act_mlp = nn.GELU(approximate="tanh")
-        self.proj_out = QuantizeLinear(dim + self.mlp_hidden_dim, dim, w_bits=w_bits, bias=True)
+        self.proj_out = QuantizeLinear(dim + self.mlp_hidden_dim, dim, w_bits=w_bits, bias=True, use_low_rank=use_low_rank, low_rank_dim=low_rank_dim, low_rank_alpha=low_rank_alpha)
 
         if is_torch_npu_available():
             deprecation_message = (
