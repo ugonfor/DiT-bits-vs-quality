@@ -4,18 +4,19 @@ Reproduces: https://chenglin-yang.github.io/1.58bit.flux.github.io/
 
 Four loss modes:
 
-  online (BEST): Online flow-matching distillation. No pre-generated dataset needed.
-    Each step: sample random Gaussian z_rand, run teacher 1-step to get pseudo-z_0,
-    then FM-train on that trajectory. Infinite diversity → no memorization.
-    z_0_pseudo = z_rand - t_large * teacher(z_rand, t_large, c)  [single Euler step]
-    z_t = (1-t)*z_0_pseudo + t*eps, loss = MSE(student(z_t,t,c), teacher(z_t,t,c))
-    Usage: python train_ternary.py --loss-type online
-
-  fm: Proper flow-matching distillation with pre-generated teacher latents.
+  fm (BEST): Proper flow-matching distillation with pre-generated teacher latents.
     1. Pre-generate teacher latents: python generate_teacher_dataset.py
     2. Train: z_t = (1-t)*z_0 + t*eps, loss = MSE(student(z_t,t,c), teacher(z_t,t,c))
-    Limited by dataset size — model may memorize fixed trajectories.
-    Usage: python train_ternary.py --loss-type fm --dataset output/teacher_dataset.pt
+    Use --balanced-sampling to ensure equal gradient weight per unique prompt.
+    Use --t-dist logit-normal for better intermediate timestep coverage.
+    Usage: python train_ternary.py --loss-type fm --dataset output/teacher_dataset.pt \
+           --balanced-sampling --t-dist logit-normal
+
+  online: Online FM distillation. No pre-generated dataset needed.
+    Pseudo-z_0 via teacher Euler denoising (--online-steps 1 = fast; 5-10 = high quality).
+    Single-step (V3/V4) caused grid artifacts at high LR. Multi-step (--online-steps 5+)
+    should solve this. Infinite diversity → no dataset memorization possible (V8 path).
+    Usage: python train_ternary.py --loss-type online --online-steps 5
 
   output (baseline, wrong distribution): Teacher/student velocity MSE at random noise z_t.
     Trains on z_t=pure_noise for ALL t. Distribution shift → images stay noisy.
