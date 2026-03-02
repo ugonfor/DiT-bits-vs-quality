@@ -351,6 +351,10 @@ def parse_args():
                         "all items. Ensures each unique prompt gets equal gradient weight "
                         "regardless of how many latent samples it has. "
                         "Recommended when dataset has unequal items-per-prompt.")
+    p.add_argument("--calib-prompts-file", type=str, default=None,
+                   help="Path to a text file with one prompt per line. When provided, these "
+                        "prompts replace CALIB_PROMPTS for online-mode training embeddings. "
+                        "Use prompts_1000.txt to get full 1000-prompt diversity in online mode.")
     return p.parse_args()
 
 
@@ -419,9 +423,15 @@ def main():
     # 2b. Pre-encode prompts → offload encoders + VAE
     # ------------------------------------------------------------------ #
     print("\n[2b] Pre-encoding calibration prompts...")
+    if args.calib_prompts_file:
+        with open(args.calib_prompts_file) as _f:
+            _active_prompts = [line.strip() for line in _f if line.strip()]
+        print(f"    Loaded {len(_active_prompts)} prompts from {args.calib_prompts_file}")
+    else:
+        _active_prompts = CALIB_PROMPTS
     calib_embeds = []
     with torch.no_grad():
-        for prompt in CALIB_PROMPTS:
+        for prompt in _active_prompts:
             pe, poe, ti = pipe.encode_prompt(
                 prompt=prompt, prompt_2=None, device=device,
                 num_images_per_prompt=1, max_sequence_length=256,
@@ -653,7 +663,31 @@ def main():
             with torch.no_grad():
                 v_teacher = teacher(**inputs, return_dict=False)[0].float().detach()
             v_student = pipe.transformer(**inputs, return_dict=False)[0].float()
-            loss = F.mse_loss(v_student, v_teacher)
+            fm_loss = F.mse_loss(v_student, v_teacher)
+
+            # Perceptual (LPIPS) loss: student z_0_pred vs pseudo-z_0 reference
+            lpips_loss = torch.tensor(0.0, device=device)
+            if lpips_fn is not None and step % args.lpips_freq == 0 and t_frac < 0.8:
+                z_0_pred = z_t.float() - t_frac * v_student
+                _vae_sf = pipe.vae_scale_factor
+                z_0_pred_sp = FluxPipeline._unpack_latents(
+                    z_0_pred.to(dtype), args.res, args.res, _vae_sf)
+                z_0_pred_sp = (z_0_pred_sp / pipe.vae.config.scaling_factor
+                               + pipe.vae.config.shift_factor)
+                img_student = pipe.vae.decode(z_0_pred_sp).sample.float().clamp(-1.0, 1.0)
+                img_student_sm = F.interpolate(img_student, size=256,
+                                               mode="bilinear", align_corners=False)
+                with torch.no_grad():
+                    z_0_ref_sp = FluxPipeline._unpack_latents(
+                        z_0_pseudo.to(dtype), args.res, args.res, _vae_sf)
+                    z_0_ref_sp = (z_0_ref_sp / pipe.vae.config.scaling_factor
+                                  + pipe.vae.config.shift_factor)
+                    img_ref = pipe.vae.decode(z_0_ref_sp).sample.float().clamp(-1.0, 1.0)
+                    img_ref_sm = F.interpolate(img_ref, size=256,
+                                               mode="bilinear", align_corners=False)
+                lpips_loss = lpips_fn(img_student_sm, img_ref_sm).mean()
+
+            loss = fm_loss + args.lpips_weight * lpips_loss
 
         elif args.loss_type == "output":
             # ---- Random-noise baseline (wrong distribution, for comparison) ----
