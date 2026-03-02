@@ -18,9 +18,13 @@ cp output/ternary_distilled_r64_res1024_s2000_fm_lpips1e-01.pt \
 echo "  Backed up V6 → v6backup.pt"
 
 echo ""
-echo "=== Step 3: Train V7 (warm-start from V6, 3000 steps) ==="
+echo "=== Step 3: Train V7 (warm-start from V6, 4000 steps) ==="
+# Key improvements vs V6:
+#  --balanced-sampling : each of 1000 prompts gets equal gradient weight (vs 3x bias toward old 174)
+#  --t-dist logit-normal : concentrate training budget at intermediate t (better velocity learning)
+#  --steps 4000         : ~1 optimizer pass per unique prompt with balanced sampling
 PYTHONUNBUFFERED=1 $PYTHON train_ternary.py \
-    --steps 3000 \
+    --steps 4000 \
     --rank 64 \
     --res 1024 \
     --lr-lora 1e-4 \
@@ -29,13 +33,15 @@ PYTHONUNBUFFERED=1 $PYTHON train_ternary.py \
     --grad-accum 4 \
     --loss-type fm \
     --lpips-weight 0.1 \
+    --t-dist logit-normal \
+    --balanced-sampling \
     --dataset output/teacher_dataset_v7.pt \
     --init-ckpt output/ternary_distilled_r64_res1024_s2000_fm_lpips1e-01.pt \
     2>&1 | tee output/train_v7.log
 
 echo ""
 echo "=== Step 4: CLIP eval on 4 fixed prompts ==="
-V7_CKPT=$(ls -t output/ternary_distilled_r64_res1024_s3000_fm_lpips*.pt 2>/dev/null | head -1)
+V7_CKPT=$(ls -t output/ternary_distilled_r64_res1024_s4000_fm_lpips*.pt 2>/dev/null | head -1)
 echo "  Using checkpoint: $V7_CKPT"
 PYTHONUNBUFFERED=1 $PYTHON eval_ternary_clip.py \
     --ckpt "$V7_CKPT" \
@@ -50,11 +56,19 @@ PYTHONUNBUFFERED=1 $PYTHON eval_quality.py \
     2>&1 | tee output/eval_v7_quality.log
 
 echo ""
-echo "=== Step 6: Diverse prompt eval (20 unseen prompts) ==="
+echo "=== Step 6: Diverse prompt eval (20 unseen prompts — generate V7, then compare V6 vs V7) ==="
+V6_CKPT=output/ternary_distilled_r64_res1024_s2000_fm_lpips1e-01.pt
+# Generate V7 diverse images (BF16 + V6 already exist from prior eval_diverse runs)
 PYTHONUNBUFFERED=1 $PYTHON eval_diverse.py \
-    --ckpt "$V7_CKPT" \
+    --models "V7:${V7_CKPT}" \
     --rank 64 \
     2>&1 | tee output/eval_v7_diverse.log
+# Rescore with V6 + V7 side by side (skip generation, images already on disk)
+PYTHONUNBUFFERED=1 $PYTHON eval_diverse.py \
+    --models "V6:${V6_CKPT}" "V7:${V7_CKPT}" \
+    --rank 64 \
+    --skip-gen \
+    2>&1 | tee output/eval_v7_diverse_compare.log
 
 echo ""
 echo "=== V7 pipeline complete ==="

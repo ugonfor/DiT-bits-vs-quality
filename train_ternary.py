@@ -25,7 +25,7 @@ Four loss modes:
     Doesn't directly optimize final velocity → images stay noisy even as loss drops.
     Usage: python train_ternary.py --loss-type layer
 """
-import os, sys, time, random, argparse, json
+import os, sys, time, random, argparse, json, math
 os.environ.setdefault("HF_HOME", "/home/jovyan/.cache/huggingface")
 
 import torch
@@ -315,11 +315,14 @@ def parse_args():
     p.add_argument("--res",        type=int,   default=1024)
     p.add_argument("--loss-type",  type=str,   default="fm",
                    choices=["fm", "online", "output", "layer"],
-                   help=("online (best): FM distillation with on-the-fly pseudo-z_0 via single-step "
-                         "teacher denoising. Infinite diversity, no memorization. No dataset needed. "
-                         "fm: proper FM distillation with pre-generated teacher latents (limited by dataset). "
+                   help=("fm: proper FM distillation with pre-generated teacher latents (recommended). "
+                         "online: on-the-fly pseudo-z_0 via teacher Euler denoising. Infinite diversity. "
                          "output: velocity MSE at random noise (wrong distribution, baseline). "
                          "layer: intermediate activation MSE (legacy)."))
+    p.add_argument("--online-steps", type=int, default=1,
+                   help="Number of Euler steps for pseudo-z_0 in online FM mode. "
+                        "Default=1 (fast but noisy). 5-10 = much cleaner pseudo-z_0, "
+                        "reduces grid artifacts, but increases per-step teacher cost.")
     p.add_argument("--dataset",    type=str,   default="output/teacher_dataset.pt",
                    help="Path to teacher latents dataset (required for --loss-type fm)")
     p.add_argument("--grad-checkpointing", action="store_true")
@@ -335,6 +338,18 @@ def parse_args():
     p.add_argument("--lpips-freq",         type=int,   default=1,
                    help="Compute LPIPS loss every N steps (default 1 = every step). "
                         "Set higher to reduce compute overhead.")
+    p.add_argument("--t-dist",             type=str,   default="uniform",
+                   choices=["uniform", "logit-normal"],
+                   help="Timestep sampling distribution. "
+                        "'uniform': t~U[0,1] (default, classic FM). "
+                        "'logit-normal': t=sigmoid(N(0,0.5)), concentrates training budget at "
+                        "intermediate t (0.3-0.7) where velocity field is most uncertain. "
+                        "Improves sharpness / perceptual quality.")
+    p.add_argument("--balanced-sampling",  action="store_true",
+                   help="Sample training items by prompt then by item, rather than uniform over "
+                        "all items. Ensures each unique prompt gets equal gradient weight "
+                        "regardless of how many latent samples it has. "
+                        "Recommended when dataset has unequal items-per-prompt.")
     return p.parse_args()
 
 
@@ -356,6 +371,7 @@ def main():
     print(f"=== Ternary FLUX Distillation ===")
     print(f"  loss={args.loss_type}, steps={args.steps}, rank={args.rank}, res={args.res}, "
           f"grad_accum={args.grad_accum}, grad_checkpointing={args.grad_checkpointing}")
+    print(f"  t-dist={args.t_dist}, balanced-sampling={args.balanced_sampling}")
     if args.lpips_weight > 0:
         print(f"  LPIPS perceptual loss: weight={args.lpips_weight}, freq=every {args.lpips_freq} steps")
 
@@ -454,6 +470,19 @@ def main():
               f"Latent shape: {fm_dataset[0]['latent_z0'].shape}")
         print(f"    Flow-matching training: z_t = (1-t)*z_0 + t*eps, "
               f"target = teacher_velocity(z_t, t)")
+        # Build prompt-level index for balanced sampling
+        from collections import defaultdict
+        _prompt_groups: dict = defaultdict(list)
+        for _i, _item in enumerate(fm_dataset):
+            _prompt_groups[_item["prompt"]].append(_i)
+        _unique_prompts = list(_prompt_groups.keys())
+        n_unique = len(_unique_prompts)
+        if args.balanced_sampling:
+            print(f"    Balanced sampling: {n_unique} unique prompts "
+                  f"(each prompt equiprobable regardless of sample count)")
+        else:
+            print(f"    Uniform item sampling: {len(fm_dataset)} items, "
+                  f"{n_unique} unique prompts")
         teacher_cache = student_cache = None
 
     elif args.loss_type == "online":
@@ -507,11 +536,23 @@ def main():
     lpips_loss = torch.tensor(0.0)
 
     for step in range(1, args.steps + 1):
-        t_frac = random.uniform(0.0, 1.0)
+        # Timestep sampling
+        if args.t_dist == "logit-normal":
+            # Logit-normal with sigma=0.5: concentrates around t=0.5
+            # sigmoid(N(0, 0.5)) has ~68% of mass in [sigmoid(-0.5), sigmoid(0.5)] = [0.38, 0.62]
+            u = random.gauss(0.0, 0.5)
+            t_frac = 1.0 / (1.0 + math.exp(-u))
+        else:
+            t_frac = random.uniform(0.0, 1.0)
 
         if args.loss_type == "fm":
             # ---- Correct flow-matching: z_t = (1-t)*z_0 + t*eps ----
-            item = random.choice(fm_dataset)
+            if args.balanced_sampling:
+                # Sample prompt uniformly → then sample a random item from that prompt's items
+                pkey = random.choice(_unique_prompts)
+                item = fm_dataset[random.choice(_prompt_groups[pkey])]
+            else:
+                item = random.choice(fm_dataset)
             z_0  = item["latent_z0"].to(device=device, dtype=dtype)   # [1, seq, 64] packed
             emb  = item
             eps  = torch.randn_like(z_0)
@@ -564,32 +605,35 @@ def main():
             loss = fm_loss + args.lpips_weight * lpips_loss
 
         elif args.loss_type == "online":
-            # ---- Online FM: pseudo-z_0 via single-step teacher Euler denoising ----
-            # Reference: EfficientDM (ICLR 2024) + flow-matching adaptation
+            # ---- Online FM: pseudo-z_0 via multi-step teacher Euler denoising ----
+            # With --online-steps=1: fast but noisy (original V3/V4, caused artifacts at high LR)
+            # With --online-steps=5-10: much cleaner pseudo-z_0 → better training signal
             emb = random.choice(calib_embeds)
             pe  = emb["prompt_embeds"].to(device=device, dtype=dtype)
             poe = emb["pooled_embeds"].to(device=device, dtype=dtype)
             ti  = emb["text_ids"].to(device=device, dtype=dtype)
 
-            # Step 1: sample random Gaussian at a large timestep
-            t_large = random.uniform(0.7, 0.95)
+            # Start from pure Gaussian noise (t=1.0) and denoise with N Euler steps to t=0
             raw_rand = torch.randn(1, _num_ch, _lat_h, _lat_w, device=device, dtype=dtype)
-            z_rand = FluxPipeline._pack_latents(raw_rand, 1, _num_ch, _lat_h, _lat_w)
-
-            # Step 2: teacher single-step Euler → pseudo-z_0
-            # z_0_pseudo = z_rand - t_large * v_teacher(z_rand, t_large, c)
+            z = FluxPipeline._pack_latents(raw_rand, 1, _num_ch, _lat_h, _lat_w)
+            n_denoise = max(1, args.online_steps)
             with torch.no_grad():
-                v_rough = teacher(
-                    hidden_states=z_rand,
-                    timestep=torch.tensor([t_large], device=device, dtype=dtype),
-                    guidance=torch.tensor([3.5],     device=device, dtype=dtype),
-                    encoder_hidden_states=pe,
-                    pooled_projections=poe,
-                    txt_ids=ti,
-                    img_ids=_img_ids,
-                    return_dict=False,
-                )[0]
-            z_0_pseudo = (z_rand - t_large * v_rough).detach()
+                for k in range(n_denoise):
+                    # Timestep goes from 1.0 down to dt (N steps, ending just above 0)
+                    t_k  = 1.0 - k / n_denoise
+                    dt   = 1.0 / n_denoise
+                    v_k  = teacher(
+                        hidden_states=z,
+                        timestep=torch.tensor([t_k], device=device, dtype=dtype),
+                        guidance=torch.tensor([3.5], device=device, dtype=dtype),
+                        encoder_hidden_states=pe,
+                        pooled_projections=poe,
+                        txt_ids=ti,
+                        img_ids=_img_ids,
+                        return_dict=False,
+                    )[0]
+                    z = z - dt * v_k  # Euler step: z_{t-dt} = z_t - dt * v(z_t, t)
+            z_0_pseudo = z.detach()
 
             # Step 3: FM trajectory from pseudo-z_0
             eps = torch.randn_like(z_0_pseudo)
