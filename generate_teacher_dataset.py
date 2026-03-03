@@ -1089,6 +1089,8 @@ def parse_args():
     p.add_argument("--out",       type=str, default="output/teacher_dataset.pt")
     p.add_argument("--start-idx", type=int, default=0,
                    help="Start cycling PROMPTS from this index (use 174 to generate only new prompts)")
+    p.add_argument("--prompts-file", type=str, default=None,
+                   help="Path to a text file with one prompt per line. When provided, replaces built-in PROMPTS list.")
     return p.parse_args()
 
 
@@ -1100,6 +1102,15 @@ def main():
     print(f"=== Teacher Dataset Generation ===")
     print(f"  n_images={args.n_images}, steps={args.steps}, res={args.res}")
 
+    # Use external prompts file if provided, otherwise fall back to built-in PROMPTS
+    if args.prompts_file:
+        with open(args.prompts_file) as _f:
+            active_prompts = [line.strip() for line in _f if line.strip()]
+        print(f"  Prompts: {len(active_prompts)} from {args.prompts_file}")
+    else:
+        active_prompts = PROMPTS
+        print(f"  Prompts: {len(active_prompts)} built-in")
+
     print("\nLoading BF16 pipeline...")
     pipe = FluxPipeline.from_pretrained(
         MODEL_NAME, torch_dtype=dtype, local_files_only=True,
@@ -1110,7 +1121,7 @@ def main():
     t0 = time.time()
 
     for i in range(args.n_images):
-        prompt = PROMPTS[(args.start_idx + i) % len(PROMPTS)]
+        prompt = active_prompts[(args.start_idx + i) % len(active_prompts)]
         seed   = args.seed + i
         gen = torch.Generator("cuda").manual_seed(seed)
 
