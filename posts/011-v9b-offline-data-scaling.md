@@ -101,17 +101,25 @@ The scaling law prediction (**90.0%**) was exact.
 
 ### Visual Inspection of Notable Prompts
 
-**p00 (lion)**: Clear lion resting on a rock at golden sunset — recognizable mane and posture. Substantially better than V7's ambiguous cat-like figure. CLIP 86.0%→95.5%.
+![V9b highlights: BF16 | V7 | V9b for 8 key prompts](../output/viz/v9b_highlights.png)
 
-**p05 (pagoda)**: Cherry blossom-framed pagoda with correct Japanese architecture, green lawn. Nearly identical to V9a's best image — 99.9% of BF16. V9b reproduces this quality without needing online FM.
+*Left column: prompt label and V9b vs V7 delta. Color bars show % of BF16 CLIP (green ≥95%, yellow 85–95%, red <85%).*
 
-**p11 (street musician)**: Rain-soaked neon street at night, musician with guitar (prompt says saxophone — wrong instrument). But the atmosphere — wet reflections, neon glow, street crowd — is vivid and convincing. CLIP jumped from V7's 72.4% to 85.2% (+47.1 points), the largest win in the eval.
+**p00 (lion)**: V9b — recognizable lion resting on a rock at golden sunset with proper mane. Substantially better than V7's ambiguous cat-like figure. CLIP 86.0%→95.5%.
 
-**p12 (sushi)**: Still showing roasted/glazed meat on a plate, not sushi. Worst-performing prompt at 69.9%. The model has never been trained on fish/raw seafood presentations — the sushi domain remains out-of-distribution even at 2,132 prompts.
+**p05 (pagoda)**: V9b virtually matches BF16 at 99.9% — correct 3-tier pagoda framed by cherry blossoms. V9b reproduces V9a's best result without needing online FM.
 
-**p13 (bread)**: A single round loaf on a wooden table — visually correct for the prompt. CLIP dropped sharply (95.1%→77.8%) despite a correct visual. The full prompt includes "with cheeses, cold cuts, and rustic accompaniments" — V9b generated just the bread, missing the context. CLIP is penalizing the incomplete scene.
+**p11 (street musician)**: V9b — rain-soaked neon street at night, musician with guitar (prompt says saxophone — wrong instrument, but atmosphere is vivid). CLIP jumped from 72.4%→85.2% (+47.1), the largest win in the eval.
 
-**p10 (ballet dancer)**: Beautiful silhouette of a dancer mid-leap above water at sunset, dramatic purple/orange sky. CLIP dropped (80.9%→76.2%) because the prompt specifies "outdoor stage" while the image shows open water — compositionally different despite being artistically strong.
+**p06 (northern lights)**: V9b — aurora-like light over a frozen lake, improvement over V7's vague glow. CLIP 86.8%→95.6%.
+
+**p12 (sushi)**: V9b still generates glazed/roasted food, not sushi. Persistent worst prompt at 69.9%. The raw seafood + rice domain remains out-of-distribution even at 2,132 prompts.
+
+**p13 (bread)**: V9b produces a single round loaf on a wooden table — visually recognizable bread. CLIP dropped sharply (95.1%→77.8%) because the full prompt asks for cheeses, cold cuts, and rustic accompaniments — V9b gave just the bread. CLIP penalizes the incomplete scene.
+
+**p14 (dragon/castle)**: V9b — dark fantasy castle in a storm with dragon silhouette, more coherent than V7. CLIP still below V7 (81.1% vs 86.7%) because the composition misses the drama of the original prompt.
+
+**p10 (ballet dancer)**: V9b — beautiful silhouette at sunset over water. CLIP dropped (80.9%→76.2%) because the prompt says "outdoor stage" but the image shows open lake. Artistically strong but semantically mismatched.
 
 ---
 
@@ -130,6 +138,8 @@ The distribution mismatch in online FM is real and measurable: online FM improve
 ---
 
 ## Updated Scaling Law
+
+![Scaling law: OOD CLIP % vs log2(unique prompts)](../output/viz/v9b_scaling_law.png)
 
 With V9b at 90.0% (2,132 prompts), the scaling model fits exactly:
 
@@ -163,6 +173,12 @@ The scaling law projects ~92% at paper scale (7,232 prompts). Even with infinite
 Maximum attack on both data and capacity ceilings simultaneously. Most expensive but potentially 93%+.
 
 The data scaling path (V9c) is proven and reliable. Rank-128 is speculative but addresses the theoretical capacity ceiling. Given that the first 3 scaling law points fit perfectly, V9c is the lower-risk next step.
+
+---
+
+## Full 20-Prompt Comparison Grid
+
+![Full grid: all 20 prompts — BF16 | V7 | V9b](../output/viz/v9b_full_grid.png)
 
 ---
 
