@@ -99,6 +99,12 @@ Fixed-prompt CLIP improved significantly (+2.2pp vs V9b) — the model generaliz
 
 **Losses vs V9b (≤−10)**: p06 N.lights (**−67.2**), p12 sushi (−39.6), p03 cathedral (−29.8), p16 forest (−16.6), p08 lavender (−14.5)
 
+### Visual Inspection of Notable Prompts
+
+![V9c highlights: BF16 | V9b | V9c for 8 key prompts](../output/viz/v9c_highlights.png)
+
+*Left column: prompt label and V9c vs V9b delta. Color bars show % of BF16 CLIP (green ≥95%, yellow 85–95%, red <85%).*
+
 ---
 
 ## Why the Scaling Law Broke
@@ -131,6 +137,8 @@ The log₂ scaling law no longer holds:
 
 The model hit a wall at ~90% OOD CLIP. Further data scaling provides diminishing (or negative) returns without increasing model capacity.
 
+![Scaling law broken: V9c misses prediction by −2.4pp](../output/viz/v9c_scaling_law.png)
+
 ---
 
 ## Key Insight: Aesthetic vs Semantic Trade-off
@@ -151,6 +159,12 @@ If capacity saturation is the primary cause (most likely), doubling the LoRA ran
 Restrict the training set to prompts that are distributionally similar to the eval set (mainstream imagery: animals, landscapes, architecture, food, portraits). Remove niche domains (polar research, deep-sea, traditional crafts). This tests hypothesis 3 directly.
 
 **Recommendation**: Option B (rank-128). The 3-point scaling law working perfectly up to 90% and then breaking suggests the model hit a capacity ceiling, not a data quality issue.
+
+---
+
+## Full 20-Prompt Comparison Grid
+
+![Full grid: all 20 prompts — BF16 | V9b | V9c](../output/viz/v9c_full_grid.png)
 
 ---
 
