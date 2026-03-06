@@ -201,8 +201,10 @@ def main():
 
     student_models = []
     for item in args.models:
-        label, ckpt_path = item.split(":", 1)
-        student_models.append((label, ckpt_path))
+        parts = item.split(":")
+        label, ckpt_path = parts[0], parts[1]
+        rank = int(parts[2]) if len(parts) > 2 else args.rank
+        student_models.append((label, ckpt_path, rank))
 
     bf16_dir = OUTPUT_DIR / "eval_diverse_bf16"
 
@@ -223,13 +225,13 @@ def main():
                             args.steps, args.seed, "BF16")
             del pipe_bf16; torch.cuda.empty_cache()
 
-        for label, ckpt_path in student_models:
+        for label, ckpt_path, rank in student_models:
             img_dir = OUTPUT_DIR / f"eval_diverse_{label.lower()}"
             if _all_images_exist(img_dir):
                 print(f"\n  All {label} images already exist in {img_dir}, skipping pipe load.")
                 continue
             print(f"\n=== [1/3] {label} generation ===")
-            pipe_s = load_student_pipe(ckpt_path, args.rank, device)
+            pipe_s = load_student_pipe(ckpt_path, rank, device)
             generate_images(pipe_s, DIVERSE_PROMPTS, img_dir,
                             args.steps, args.seed, label)
             del pipe_s; torch.cuda.empty_cache()
@@ -248,7 +250,7 @@ def main():
 
     # Collect per-prompt scores for every model
     all_results = {"BF16": []}
-    for label, _ in student_models:
+    for label, *_ in student_models:
         all_results[label] = []
 
     for i, prompt in enumerate(DIVERSE_PROMPTS):
@@ -263,7 +265,7 @@ def main():
         all_results["BF16"].append(
             {"idx": i, "prompt": prompt, "aes": aes_bf16, "clip": cl_bf16, "lpips": None})
 
-        for label, _ in student_models:
+        for label, *_ in student_models:
             img_dir = OUTPUT_DIR / f"eval_diverse_{label.lower()}"
             s_path  = img_dir / f"p{i:02d}.png"
             if not s_path.exists():
@@ -282,7 +284,7 @@ def main():
         cat = PROMPT_CATEGORIES[i]
         print(f"  p{i:02d} [{cat:12s}] {prompt[:50]}")
         print(f"    BF16: aes={aes_bf16:.2f} clip={cl_bf16:.4f}")
-        for label, _ in student_models:
+        for label, *_ in student_models:
             r = all_results[label][-1]
             if r:
                 print(f"    {label:<6}: aes={r['aes']:.2f} clip={r['clip']:.4f} lpips={r['lpips']:.4f}")
@@ -303,7 +305,7 @@ def main():
         print(f"  {label:<6}: aes={avg_aes:.3f}  clip={avg_clip:.4f}{lp_str}")
 
     bf16_avg_clip = averages["BF16"]["avg_clip"]
-    for label, _ in student_models:
+    for label, *_ in student_models:
         if label in averages:
             pct = averages[label]["avg_clip"] / bf16_avg_clip * 100
             print(f"  {label} / BF16 CLIP: {pct:.1f}%")
