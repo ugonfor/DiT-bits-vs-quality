@@ -11,6 +11,7 @@ from models.ternary import quantize_to_ternary
 MODEL_NAME = "black-forest-labs/FLUX.1-dev"
 CKPTS = {
     "ternary_r64":  "output/ternary_distilled_r64_res1024_s6000_fm_lpips1e-01.pt",  # V9b
+    "ternary_r128": "output/ternary_distilled_r128_res1024_s12000_fm_lpips1e-01.pt",  # V10b
 }
 PROMPT = "A majestic lion resting on a savanna at golden hour"
 RES    = 1024
